@@ -2,6 +2,37 @@
 #include <stdio.h>
 #include <sys/mman.h>
 
+
+
+
+/*  Representation of a memory page:
+
+    +----------------------------------------------+
+    | Ptr to previous page (none if head)          | size_t
+    +----------------------------------------------+
+    | Size of page & 0b011 (start marker)          | size_t
+    +----------------------------------------------+
+    | Bloc header: size (multiple of 8) & 0b00x    | size_t
+    | where x is the used flag                     | 
+    +----------------------------------------------+
+    |             user memory space                |
+    |           footer - header = size             |
+    +----------------------------------------------+
+    | Bloc footer: same as header                  | size_t
+    +----------------------------------------------+
+    | New header ...                               | size_t
+    +----------------------------------------------+
+    | ect ...                                      |
+    +----------------------------------------------+
+    | Footer                                       | size_t
+    +----------------------------------------------+
+    | Size of page & 0b010 (end marker)            | size_t
+    +----------------------------------------------+
+    | Ptr to next page (ptr to end marker,         |
+    | for some optimizations)                      | size_t
+    +----------------------------------------------+
+*/
+
 #define IS_USED(p) (GET_VALUE(p) & 1) // is the bloc currently used
 #define SIZE(p) (GET_VALUE(p) & ~0b11) // get size of block
 #define NEXT(p) ((p) + SIZE(p)) // get header of next bloc from header of current header
@@ -13,13 +44,19 @@
 
 #define SET_USED(p) (SET_VALUE(p, GET_VALUE(p) | 0b1)) // set bloc as used
 #define SET_FREE(p) (SET_VALUE(p, GET_VALUE(p) & ~0b1)) // set bloc as unused
-#define SET_END(p) (SET_VALUE(p, 0b10)) // set end marker
-#define NEXT_BLOC(p) (*(void**)(p + sizeof(size_t)))
-#define PADDING_SIZE (3 * sizeof(size_t)) // header/footer + end/start marker + next bloc addr
+#define SET_END(p, size) (SET_VALUE(p, size | 0b10)) // set end marker
+#define SET_START(p, size) (SET_VALUE(p, size | 0b11)) // set end marker
+#define NEXT_PAGE(p) (*(void**)(p + sizeof(size_t)))
+#define TOP_PADDING_SIZE (2 * sizeof(size_t)) // start marker + prev bloc addr
+#define PREV_PAGE(p) (*(void**)(p - TOP_PADDING_SIZE))
+#define BOTTOM_PADDING_SIZE (2 * sizeof(size_t)) // end marker + next bloc addr
+#define PADDING_SIZE (TOP_PADDING_SIZE + BOTTOM_PADDING_SIZE) // end/start marker + next/prev bloc addr
 
 #define CLEAR(p) (SET_VALUE(p, 0))
 
 #define BASE_ALLOC_SIZE (1 << 16) // 2^16 might be a big minimum for each bloc but meh whatever
+
+#define DEBUG_BLOC(p) fprintf(stderr, "bloc at %p with value %lu\n", p, GET_VALUE(p))
 
 
 static void* base_memory_space = NULL;
@@ -49,50 +86,68 @@ static size_t normalize_size(size_t size) {
 }
 
 
-static void init_bloc(void* mem, size_t size) {
-    size_t bloc_size = size - PADDING_SIZE;
-    SET_VALUE(mem, size | 0b11);
-    mem += sizeof(size_t);
+static void init_page(void* page, void* prev_page, size_t size) {
+    // size of the bloc in the page
+    size_t bloc_size = size - PADDING_SIZE; 
+    // set previous page ptr
+    SET_VALUE(page, (size_t)prev_page);
+    // set page size
+    SET_START(page + sizeof(size_t), size);
+    // move to header
+    page += TOP_PADDING_SIZE;
     // init header
-    CLEAR(mem);
-    SET_SIZE(mem, bloc_size);
+    CLEAR(page);
+    SET_SIZE(page, bloc_size);
     // init footer
-    CLEAR(FOOTER(mem));
-    SET_SIZE(FOOTER(mem), bloc_size);
+    void* footer = FOOTER(page);
+    CLEAR(footer);
+    SET_SIZE(footer, bloc_size);
     // end marker
-    SET_END(NEXT(mem));
-    SET_VALUE(NEXT(mem) + sizeof(size_t), (size_t)NULL);
+    void* end_marker = NEXT(page);
+    SET_END(end_marker, size);
+    // set addr to next page
+    SET_VALUE(end_marker + sizeof(size_t), (size_t)NULL);
 }
 
-static void* alloc_memory_space(size_t min_size) {
+static void* map_page(size_t min_size, void* prev_bloc) {
 
+    // calculate needed size
     if(BASE_ALLOC_SIZE < (min_size + PADDING_SIZE)) {
         min_size += PADDING_SIZE;
     } else {
         min_size = BASE_ALLOC_SIZE;
     }
 
-    void* m = mmap(0, min_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    void* m = mmap(
+        NULL, 
+        min_size, 
+        PROT_READ | PROT_WRITE, // we want read/write acces
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1, // tell OS it's for heap usage
+        0 // don't really car about offset
+    );
+
     if(m == MAP_FAILED) {
         return NULL;
     } else {
-        init_bloc(m, min_size);
+        init_page(m, prev_bloc, min_size);
         return m;
     }
 }
 
 
-static void* realloc_memory_space(void* prev_bloc_end_marker, size_t min_size) {
+static void* map_new_page(void* prev_page_end_marker, size_t min_size) {
 
-    void* m = alloc_memory_space(min_size);
+    void* m = map_page(min_size, prev_page_end_marker);
 
     if(m == NULL) {
         return NULL;
     }
 
-    SET_VALUE(prev_bloc_end_marker + sizeof(size_t), (size_t)m);
+    // set end of previous page to addr of new page
+    SET_VALUE(prev_page_end_marker + sizeof(size_t), (size_t)m);
 
-    return m;
+    return m; // ret new page
 }
 
 static void alloc_bloc(void* header, size_t size) {
@@ -100,7 +155,11 @@ static void alloc_bloc(void* header, size_t size) {
     size_t newSize = prevSize - size;
     // we need the space for header and footer, bloc can't be 0 sized
     // so if the remaining space is smaller than that just alloc the whole bloc
-    if(newSize >= 2 * sizeof(size_t)) { 
+    if(newSize >= 2 * sizeof(size_t)) {
+        // we just test if there is space for header/footer,
+        // if there is space just for that the bloc is kind of useless,
+        // but meh 
+
         SET_SIZE(FOOTER(header), newSize); // set old footer to new free size
         CLEAR(HEADER(FOOTER(header))); // clear new header
         SET_SIZE(HEADER(FOOTER(header)), newSize); // set new header to new free size
@@ -114,41 +173,37 @@ static void alloc_bloc(void* header, size_t size) {
 
 void* search_empty_bloc(size_t size) {
     // I'm lazy so first fit strategy
-    void* p = base_memory_space + sizeof(size_t);
+    void* p = base_memory_space + TOP_PADDING_SIZE;
 
     search_loop:
 
+    // wearch for first bloc where we can fit it
     while (!IS_END(p) && (IS_USED(p) || SIZE(p) < size)) {
         p = NEXT(p);
     }
 
     if (IS_END(p)) {
-        void* next_block = NEXT_BLOC(p);
-        if(next_block == NULL) {
+        void* next_page = NEXT_PAGE(p);
+        if(next_page == NULL) {
             // allocate more space
-            next_block = realloc_memory_space(p, size);
-            if(next_block == NULL) {
-                // reallocation failed
+            next_page = map_new_page(p, size);
+            if(next_page == NULL) {
+                // allocation failed
                 return NULL;
             }
         }
-        p = next_block + sizeof(size_t);
+        p = next_page + TOP_PADDING_SIZE; // skip page padding
         
-
-        goto search_loop; // yeah goto bad blah blah blah IDGAF
+        goto search_loop; 
+        // yeah goto bad blah blah blah IDGAF
+        // either clean goto or weirds nested loops with breaks and stuff, or worst, recursion
     }
+
     return p;
 }
 
 
 void* customAlloc_malloc(size_t size) {
-    if(base_memory_space == NULL) {
-        void* m = alloc_memory_space(normalize_size(size));
-        if(m == NULL) {
-            return NULL;
-        }
-        base_memory_space = m;
-    }
     if (size == 0) { 
         // so if size is 0, 2 ways, return NULL or valid pointer
         // I'm lazy so first option 
@@ -156,16 +211,25 @@ void* customAlloc_malloc(size_t size) {
         return NULL;
     }
 
-    //first alloc good size
     size = normalize_size(size);
+
+    if(base_memory_space == NULL) {
+        // init memory_space
+        void* m = map_page(size, NULL);
+        if(m == NULL) {
+            return NULL;
+        }
+        base_memory_space = m;
+    }
     
     void* p = search_empty_bloc(size);
     
     alloc_bloc(p, size);
-    return p + sizeof(size_t); // return pointer to data
+
+    return p + sizeof(size_t); // skip header
 }
 
-inline static void merge(void* low, void* high) {
+static void merge(void* low, void* high) {
     if (!IS_END(high) && !IS_USED(high) && !IS_USED(low)) {
         size_t total_size = SIZE(low) + SIZE(high);
         SET_SIZE(low, total_size);
@@ -178,11 +242,38 @@ static void merge_with_next(void* header) {
     merge(header, next);
 }
 
-static void merge_with_prev(void* header) {
+static void* merge_with_prev(void* header) {
     if(!IS_START(header - sizeof(size_t))) {
         void* prev = PREV(header);
         merge(prev, header);
-    }   
+        return prev;
+    }
+    return header;
+}
+
+static void unmap_page(void** page) {
+    void* page_start = *page;
+    // to get page size skip previous page ptr and remove flags 
+    size_t page_size = (*(size_t*)(page_start + sizeof(size_t))) & ~0b11;
+    // keep ptr to next page
+    void* next_page = *(void**)(page_start + page_size - sizeof(size_t));
+
+    munmap(page_start, page_size);
+
+    // replace ptr to page with next page
+    *page = next_page; 
+
+    if(next_page != NULL) {
+        // now need to replace ptr to prev page on next page
+        *(void**)next_page = page - 1; // need to move to end_marker
+    }
+
+}
+
+void customAlloc_unmap_all() {
+    while(base_memory_space != NULL) {
+        unmap_page(&base_memory_space);
+    }
 }
 
 static void dealloc_bloc(void* header) {
@@ -190,7 +281,26 @@ static void dealloc_bloc(void* header) {
     SET_FREE(FOOTER(header));
     // ! Merge with next first so header stay valid
     merge_with_next(header);
-    merge_with_prev(header);
+    header = merge_with_prev(header);
+
+    // now check if page is empty to unmap it
+
+    if(
+        IS_START(header - sizeof(size_t)) // check if header is top of page
+        && (SIZE(header - sizeof(size_t)) == (SIZE(header) + PADDING_SIZE)) // check if page is empty
+    ) {
+        void* current_page = header - TOP_PADDING_SIZE;
+        // empty page
+        // grab ptr to previous page
+        void* prev_page = *(void**)current_page;
+        if(prev_page == NULL) {
+            // current page is top page, so pointer holder is actually base_memory_space
+            unmap_page(&base_memory_space);
+        } else {
+            // prev_page point to end marker, need to shift to actual pointer
+            unmap_page((void**)(prev_page + sizeof(size_t)));
+        }
+    }
 }
 
 void customAlloc_free(void* p) {
@@ -198,6 +308,7 @@ void customAlloc_free(void* p) {
         return;
     }
     void* header = p - sizeof(size_t);
+    
     if (!IS_USED(header)) {
         fprintf(stderr, "Attempt to free unallocated memory\n");
         exit(1);
@@ -205,21 +316,7 @@ void customAlloc_free(void* p) {
     dealloc_bloc(header);
 }
 
-static void unmap_bloc(void** bloc) {
-    void* bloc_start = *bloc;
-    size_t bloc_size = (*(size_t*)bloc_start) & ~0b11;
-    void* next_bloc = *(void**)(bloc_start + bloc_size - sizeof(size_t));
 
-    munmap(bloc_start, bloc_size);
-
-    *bloc = next_bloc; 
-}
-
-void customAlloc_unmap_all() {
-    while(base_memory_space != NULL) {
-        unmap_bloc(&base_memory_space);
-    }
-}
 
 static void realloc_shrink(void* header, size_t new_size) {
     size_t bloc_size = SIZE(header);
@@ -268,10 +365,12 @@ static void* realloc_grow(void* header, size_t new_size) {
         // PERFECT ! best case possible, we can just grow and no copy !
         // now check if we cut the bloc, or take it entirely
 
+        
         // we take it entirely if there is no place for header/footer in left space
         size_t next_bloc_size = SIZE(next_header);
+        size_t new_next_bloc_size = next_bloc_size - diff;
         // left just space for header/footer make it kinda useless but meh whatever
-        if(next_bloc_size < 2 * sizeof(size_t)) { 
+        if(new_next_bloc_size < 2 * sizeof(size_t)) { 
             // just take whole bloc
             void* footer = FOOTER(next_header);
             SET_SIZE(footer, new_size);
@@ -282,10 +381,13 @@ static void* realloc_grow(void* header, size_t new_size) {
         } else {
             // we got space for header/footer
             void* next_footer = FOOTER(next_header);
-            SET_SIZE(next_footer, diff);
+            SET_SIZE(next_footer, new_next_bloc_size);
             void* new_next_header = HEADER(next_footer);
             CLEAR(new_next_header);
-            SET_SIZE(new_next_header, diff);
+            SET_SIZE(new_next_header, new_next_bloc_size);
+
+            DEBUG_BLOC(new_next_header);
+
             // set size for bloc
             SET_SIZE(header, new_size);
             void* footer = FOOTER(header);
@@ -293,7 +395,7 @@ static void* realloc_grow(void* header, size_t new_size) {
             SET_SIZE(footer, new_size);
             SET_USED(footer);
         }
-        return header + sizeof(size_t);
+        return header + sizeof(size_t); //skip header
     } else {
         // sadly, we need to reallocate...
 
@@ -309,7 +411,7 @@ static void* realloc_grow(void* header, size_t new_size) {
         // dealloc old bloc
         dealloc_bloc(header);
 
-        return m + sizeof(size_t);
+        return m + sizeof(size_t); // skip header
     }
 }
 
@@ -354,20 +456,20 @@ void* customAlloc_realloc(void* p, size_t new_size) {
 
 void print_bloc(void* header) {
     size_t size = SIZE(header);
-    printf("\tBloc start at %p with size %lu, used: %lu\n", header, size, IS_USED(header));
+    printf("\t\tBloc start at %p with size %lu, used: %lu\n", header, size, IS_USED(header));
 }
 
 void* print_page(void* page_start) {
-    size_t page_size = SIZE(page_start);
-    printf("--- START OF PAGE ---\n");
-    printf("Page starting at %p with size %lu\n", page_start, page_size);
-    void* b = page_start + sizeof(size_t);
+    size_t page_size = SIZE(page_start + sizeof(size_t));
+    printf("\t--- START OF PAGE ---\n");
+    printf("\tPage starting at %p with size %lu\n", page_start, page_size);
+    void* b = page_start + TOP_PADDING_SIZE;
     while(!IS_END(b)) {
         print_bloc(b);
         b = NEXT(b);
     }
-    printf("---  END OF PAGE  ---\n");
-    return NEXT_BLOC(b);
+    printf("\t---  END OF PAGE  ---\n");
+    return NEXT_PAGE(b);
 }
 
 
@@ -375,9 +477,9 @@ void* print_page(void* page_start) {
 
 void customAlloc_print_memspace() {
     void* m = base_memory_space;
-    printf("------ START OF MEMORY SPACE ------\n");
+    printf("------- START OF MEMORY SPACE -------\n");
     while(m != NULL) {
          m = print_page(m);
     }
-    printf("------  END OF MEMORY SPACE  ------\n");
+    printf("-------  END OF MEMORY SPACE  -------\n");
 }
